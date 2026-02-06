@@ -12,7 +12,7 @@ class Section:
     text : str = ''
     got_split : bool = False
 
-def chunking(text: str, meta_default: dict[str, any], base_name: str):
+def chunking(base_name: str, text: str, meta_default: dict[str, any]):
     '''chunks the text into sections based on markers and writes to JSONL'''
     def _get_content_hash(text: str) -> str:
         import hashlib
@@ -75,7 +75,7 @@ def chunking(text: str, meta_default: dict[str, any], base_name: str):
         char_pos -= overlap
         nxt_line['metadata']['content_hash'] = content_hash
         out.append(nxt_line)
-    return (out, base_name)
+    return out
 
 def _get_sentences(text: str) -> list[str]:
     text = text.strip()

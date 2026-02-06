@@ -3,8 +3,10 @@ from html import unescape
 from collections import Counter
 import re
 
-def extract_urls(domain: str, canonical_url: str, html: str) -> list[tuple[str, int]]:
+def extract_urls(metadata: dict[dict[str]], html: str) -> list[tuple[str, int]]:
     hrefs: list[str] = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I)
+    canonical_url = metadata.get('metadata').get('canonical_url')
+    domain = metadata.get('metadata').get('domain')
     suffix = re.search(rf'{re.escape(domain)}(.*)$', canonical_url).group(1)
     out = []
     for h in hrefs:
@@ -19,4 +21,4 @@ def extract_urls(domain: str, canonical_url: str, html: str) -> list[tuple[str, 
         if h.endswith(suffix): continue
         if canonical_url in url: continue
         out.append(url)
-    return Counter(out).most_common()
+    return Counter(out).most_common()[:10]

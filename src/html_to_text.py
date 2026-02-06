@@ -2,15 +2,19 @@ from src.config.filters.filter_attribute import *  # Attribute-based filters
 from src.config.filters.filter_class import *  # Class-based filters
 from src.config.filters.filter_id import *  # ID-based filters
 from src.config.filters.filter_tag import *  # Tag-based filters
+from src.extract_metadata import extract_metadata  # reuse existing metadata extractor (no reimplementation)
 from dataclasses import dataclass
+from playwright.sync_api import sync_playwright
+from tkinter.scrolledtext import ScrolledText  # preview textbox with scroll
+from tkinter import ttk  # ttk widgets for nicer UI
+from pathlib import Path  # path utilities
 from lxml import etree as ET
 from typing import Iterable
-import re
+import re, webbrowser, sys, json, tkinter as tk
 
 _PROJECT_ROOT = ''
 _TITLE = ''  # global document title for section removal dialog
 _WHITESPACE = re.compile(r'\s+')  # regex to match whitespace sequences
-_HEADINGS = []
 
 @dataclass(frozen=True)
 class Node:
@@ -18,13 +22,12 @@ class Node:
     text : str  # extracted text
     lvl : int = 0  # heading level, 0 if not a heading
 
-def html_to_text(doc_title: str, html: str, project_root, urls: list[str]) -> str:
+def html_to_text(doc_title: str, html: str, project_root) -> str:
     '''main function: HMTL -> Plaintext'''
     global _TITLE; _TITLE = doc_title
     global _PROJECT_ROOT; _PROJECT_ROOT = project_root
     if not html: return ''
     root = _html_to_ET(html)  # create lxml tree
-    _remove_custom_sections(root)
     _insert_section_markers(root)
     raw = '\n'.join(block.text for block in _get_blocks(root))  # extract text blocks and join
     clean_txt = _merge_lines(raw)
@@ -168,18 +171,6 @@ def _normalize_whitespace(text: str, multiline: bool = False) -> str:
         return '\n'.join(line for line in lines if line)  # join non-empty lines
 
 
-def _remove_custom_sections(root: ET.Element) -> None:
-    '''removes user-selected sections based on headings'''
-    global _HEADINGS
-    _HEADINGS = _get_headings(root)
-    if not _HEADINGS: return  # no headings found
-    
-    to_remove = _get_headings_to_remove(root, _HEADINGS)
-    if not to_remove: return  # nothing to remove
-    
-    ranges = _get_removal_ranges(_HEADINGS, to_remove)  # get removal ranges
-    for start, end in reversed(ranges): _remove_between(start, end)  # remove in reverse order
-
 def _get_headings(root: ET.Element) -> list[Node]:
     '''iterates over whole tree and returns all headings'''
     def _iter_visible(node):
@@ -209,110 +200,6 @@ def _get_lvl(node: ET.Element) -> int | None:
         if isinstance(aria_level, str) and aria_level.strip().isdigit():  # aria-level attribute
             return int(aria_level.strip())  # return level
     return None  # not a heading
-
-def _get_headings_to_remove(root: ET.Element, headings: list[Node]) -> list[Node]:
-    '''displays a dialog to select headings to remove'''
-    import copy, json, tkinter as tk
-    from tkinter import ttk
-    from tkinter.scrolledtext import ScrolledText
-
-    path = f'{_PROJECT_ROOT}/src/config/section_state.json'  # path to state file
-    keys = [f'{i+1}. {h.text.strip()} (lvl: {h.lvl})' for i, h in enumerate(headings)]  # keys for state
-
-    def load_state() -> dict[str, bool]:
-        '''loads the saved state from file'''
-        state = {k: True for k in keys}  # default: all selected
-        try:
-            with open(path, "r", encoding="utf-8") as f: data = json.load(f)  # load JSON
-        except (FileNotFoundError, json.JSONDecodeError): return state
-        doc = data.get(_TITLE, {}) if isinstance(data, dict) else {}  # get doc-specific data
-        if isinstance(doc, dict): state.update({k: bool(doc.get(k, True)) for k in keys})  # update state
-        return state
-    def save_state(state_vars: dict[str, tk.BooleanVar]) -> None:
-        '''saves the current state to file'''
-        doc_data = {k: v.get() for k, v in state_vars.items()}  # extract current state
-        try:
-            with open(path, "r", encoding="utf-8") as f: data = json.load(f)  # load existing data
-        except (FileNotFoundError, json.JSONDecodeError): data = {}
-        if not isinstance(data, dict): data = {}
-        data[_TITLE] = doc_data
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)  # save JSON
-    def render_preview() -> None:
-        '''renders the preview based on current selection'''
-        nonlocal state
-        tmp_root = copy.deepcopy(root)  # temporary copy of the tree
-        tmp_heads = _get_headings(tmp_root)  # temporary headings
-
-        to_remove_idx = [i for i, k in enumerate(keys) if not state[k].get()]  # indices to remove
-        tmp_remove = [tmp_heads[i] for i in to_remove_idx if i < len(tmp_heads)]  # corresponding nodes
-
-        if tmp_remove:
-            tmp_ranges = _get_removal_ranges(tmp_heads, tmp_remove)  # get removal ranges
-            for start, end in reversed(tmp_ranges): _remove_between(start, end)  # remove in reverse order
-
-        raw = "\n".join(block.text for block in _get_blocks(tmp_root))  # extract text blocks
-        txt = _merge_lines(raw)  # merge lines
-
-        preview.configure(state="normal")
-        preview.delete("1.0", "end")
-        preview.insert("1.0", txt)
-        preview.configure(state="disabled")
-    def ok() -> None:
-        '''handles OK button press'''
-        nonlocal result
-        result = [headings[i] for i, k in enumerate(keys) if not state[k].get()]  # extract selected headings
-        save_state(state)  # save current state
-        select_win.destroy()
-    def abort() -> None:
-        '''handles window close'''
-        import sys
-        sys.exit(0)
-    
-    select_win = tk.Tk()  # create main window
-    # region GUI
-    select_win.title("Select Headings to Remove")
-    select_win.geometry("1100x800")
-    tk.Label(select_win, text="Uncheck headings you want to REMOVE.").pack(pady=8)
-
-    paned = ttk.PanedWindow(select_win, orient="horizontal")  # create paned window
-    paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))  # pack paned window
-    left = ttk.Frame(paned)  # left frame for checkboxes
-    right = ttk.Frame(paned)  # right frame for preview
-    paned.add(left, weight=1)  # add frames to paned window
-    paned.add(right, weight=3)  # right frame larger
-
-    # --- left window ---
-    c = tk.Canvas(left)
-    sb = ttk.Scrollbar(left, orient="vertical", command=c.yview)
-    c.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")  # scrollbar on right
-    c.pack(side="left", fill="both", expand=True)  # canvas on left
-
-    f = ttk.Frame(c)
-    w = c.create_window((0, 0), window=f, anchor="nw")
-    f.bind("<Configure>", lambda e: c.configure(scrollregion=c.bbox("all")))  # update scrollregion
-    c.bind("<Configure>", lambda e: c.itemconfigure(w, width=e.width))  # update frame width
-    
-    # --- right window ---
-    preview = ScrolledText(right, wrap="word")
-    preview.pack(fill="both", expand=True)
-    preview.configure(state="disabled")
-    # endregion
-    
-    init = load_state()
-    state = {k: tk.BooleanVar(value=init[k]) for k in keys}  # create state variables
-
-    for k, v in state.items():  # create checkboxes
-        ttk.Checkbutton(f, text=k, variable=v).pack(anchor="w")
-        v.trace_add("write", lambda *_: render_preview())  # update preview on change
-
-    result: list[Node] = []
-    ttk.Button(select_win, text="OK", command=ok).pack(pady=(0, 10))  # OK button
-    select_win.protocol("WM_DELETE_WINDOW", abort)  # handle window close
-
-    render_preview()  # initial preview render
-    select_win.mainloop()
-    return result
 
 def _get_removal_ranges(all_headings: list[Node], to_remove: list[Node]) -> list[tuple[ET.Element, ET.Element | None]]:
     '''determines ranges of headings to remove'''
@@ -399,260 +286,253 @@ def _insert_section_markers(root: ET.Element) -> None:
     for h in headings:
         h.node.text = f'<<<SECTION: {h.text}; level: {h.lvl}>>>'  # insert marker
 
-# =========================  MINIMAL MULTI-SITE SESSION  =========================  # NEW
 
-class DocumentState:  # NEW
-    def __init__(  # NEW
-        self,  # NEW
-        url_requested: str,  # NEW
-        base_name: str,  # NEW
-        html: str,  # NEW
-        metadata: dict[str, any],  # NEW
-        canonical_url: str | None,  # NEW
-        urls_ranked: list[tuple[str, int]],  # NEW
-        root: ET.Element,  # NEW
-    ):  # NEW
-        self.url_requested = url_requested  # NEW
-        self.base_name = base_name  # NEW
-        self.html = html  # NEW
-        self.metadata = metadata  # NEW
-        self.canonical_url = canonical_url  # NEW
-        self.urls_ranked = urls_ranked  # NEW
-        self.root = root  # NEW
-        self.heading_keys: list[str] = []  # NEW
-        self.heading_state: dict[str, bool] = {}  # NEW
-        self.next_url_idx: int = 0  # NEW
-        self.final_text: str = ''  # NEW
+@dataclass  # simple container for one processed website (what the pipeline will write + chunk)
+class Doc:  # returned objects from the GUI flow into process_html_files.py
+    url: str  # the page URL (identity / debug / printing)
+    title: str  # title used as directory + file prefix by your pipeline
+    html: str  # raw HTML content (written as *_input.txt by the pipeline)
+    text: str  # final plaintext (written as *_output.txt and chunked)
+    metadata: dict[str, any]  # your metadata dict as produced by extract_metadata()
+    state: dict[str, bool]  # per-section checkbox state saved to section_state.json
 
-def review_session(initial_docs: list[DocumentState], load_doc_fn):  # NEW
-    import copy  # NEW
-    import tkinter as tk  # NEW
-    from tkinter import ttk, messagebox  # NEW
-    from tkinter.scrolledtext import ScrolledText  # NEW
-
-    import json  # NEW
-    from pathlib import Path  # NEW
-
-    path = Path(__file__).resolve().parent / "config" / "section_state.json"  # NEW
-
-    def load_state(doc_key: str, keys: list[str]) -> dict[str, bool]:  # NEW
-        state = {k: True for k in keys}  # NEW
-        try:  # NEW
-            with open(path, "r", encoding="utf-8") as f:  # NEW
-                data = json.load(f)  # NEW
-        except (FileNotFoundError, json.JSONDecodeError):  # NEW
-            return state  # NEW
-        doc = data.get(doc_key, {}) if isinstance(data, dict) else {}  # NEW
-        if isinstance(doc, dict):  # NEW
-            state.update({k: bool(doc.get(k, True)) for k in keys})  # NEW
-        return state  # NEW
-
-    def save_all_states() -> None:  # NEW
-        try:  # NEW
-            with open(path, "r", encoding="utf-8") as f:  # NEW
-                data = json.load(f)  # NEW
-        except (FileNotFoundError, json.JSONDecodeError):  # NEW
-            data = {}  # NEW
-        if not isinstance(data, dict):  # NEW
-            data = {}  # NEW
-
-        for d in docs:  # NEW
-            if not d.heading_keys:  # NEW
-                continue  # NEW
-            data[d.base_name] = {k: bool(d.heading_state.get(k, True)) for k in d.heading_keys}  # NEW
-
-        path.parent.mkdir(parents=True, exist_ok=True)  # NEW
-        with open(path, "w", encoding="utf-8") as f:  # NEW
-            json.dump(data, f, ensure_ascii=False, indent=2)  # NEW
+def download_html(url: str, ROOT: str):  # download a page without writing anything to disk (Abort must not write)
+    _WIN_RESERVED = {  # these stuff cant be in name for dictionary or file on windows
+        "CON","PRN","AUX","NUL",
+        *(f"COM{i}" for i in range(1,10)),
+        *(f"LPT{i}" for i in range(1,10)),
+    }
+    def safe_windows_name(name: str, fallback: str = "untitled") -> str:
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)  # remove forbidden chars
+        name = name.strip().strip(" .")  # remove dot at end
+        name = re.sub(r"\s+", " ", name)  # remove whitespace
+        if name.upper() in _WIN_RESERVED: name = "_" + name  # avoid reserved names
+        name = name[:80].rstrip(" .")  # shorten if too long
+        return name or fallback
     
-    docs: list[DocumentState] = list(initial_docs or [])  # NEW
-    if not docs:  # NEW
-        return []  # NEW
+    html, title = _load_cached_raw(url, ROOT)
+    if html: return html, title
+    
+    global _PROJECT_ROOT; _PROJECT_ROOT = ROOT  # store project root for this module (paths/state)
+    with sync_playwright() as p:  # open playwright session
+        browser = p.chromium.launch(channel="msedge", headless=True)  # start headless browser (same as before)
+        page = browser.new_page()  # create a new page/tab
+        page.goto(url, wait_until="networkidle")  # load URL and wait until network is idle
+        title = safe_windows_name(page.title())  # use document title
+        html = page.content()  # get full HTML
+        browser.close()  # close browser to free resources
+    return html, title  # return in-memory only (no disk write here)
 
-    loaded: set[str] = set()  # NEW
-    seed_doc = docs[0]  # NEW
-    seed_next = {"i": 0}  # NEW
-    for d in docs:  # NEW
-        if d.url_requested: loaded.add(d.url_requested)  # NEW
-        if d.canonical_url: loaded.add(d.canonical_url)  # NEW
+def _load_cached_raw(url: str, ROOT: str) -> tuple[str, str]:
+    state_path = Path(ROOT) / "src/config/section_state.json"
+    if not state_path.exists(): return "", ""
+    data = json.loads(state_path.read_text(encoding="utf-8") or "{}")
+    entry = data.get(url, {})
+    if not isinstance(entry, dict): return "", ""
+    title = entry.get("title", "")
+    if title:
+        raw_path = Path(ROOT) / "data" / title / f"{title}_raw.html"
+        if raw_path.exists(): return (raw_path.read_text(encoding="utf-8"), title)
+        else: return '', ''
+    return '', ''
 
-    def ensure_keys(doc: DocumentState) -> None:  # NEW
-        if doc.heading_keys:  # NEW
-            return  # NEW
-        heads = _get_headings(doc.root)  # NEW
-        doc.heading_keys = [f'{i+1}. {h.text.strip()} (lvl: {h.lvl})' for i, h in enumerate(heads)]  # NEW
-        doc.heading_state = load_state(doc.base_name, doc.heading_keys)  # CHANGED
-
-
-    def preview_text(doc: DocumentState) -> str:  # NEW
-        ensure_keys(doc)  # NEW
-        tmp_root = copy.deepcopy(doc.root)  # NEW
-        tmp_heads = _get_headings(tmp_root)  # NEW
-        to_remove_idx = [i for i, k in enumerate(doc.heading_keys) if not doc.heading_state.get(k, True)]  # NEW
-        tmp_remove = [tmp_heads[i] for i in to_remove_idx if i < len(tmp_heads)]  # NEW
-        if tmp_remove:  # NEW
-            tmp_ranges = _get_removal_ranges(tmp_heads, tmp_remove)  # NEW
-            for start, end in reversed(tmp_ranges):  # NEW
-                _remove_between(start, end)  # NEW
-        raw = "\n".join(block.text for block in _get_blocks(tmp_root))  # NEW
-        return _merge_lines(raw)  # NEW
-
-    def apply_removals_inplace(doc: DocumentState) -> None:  # NEW
-        ensure_keys(doc)  # NEW
-        heads = _get_headings(doc.root)  # NEW
-        to_remove_idx = [i for i, k in enumerate(doc.heading_keys) if not doc.heading_state.get(k, True)]  # NEW
-        to_remove = [heads[i] for i in to_remove_idx if i < len(heads)]  # NEW
-        if to_remove:  # NEW
-            ranges = _get_removal_ranges(heads, to_remove)  # NEW
-            for start, end in reversed(ranges):  # NEW
-                _remove_between(start, end)  # NEW
-
-    def finalize_text(doc: DocumentState) -> str:  # NEW
-        _insert_section_markers(doc.root)  # NEW
-        raw = "\n".join(block.text for block in _get_blocks(doc.root))  # NEW
-        return _merge_lines(raw)  # NEW
-
-    win = tk.Tk()  # NEW
-    win.title("Section Review (Multi-Site)")  # NEW
-    win.geometry("1200x850")  # NEW
-
-    top = ttk.Frame(win)  # NEW
-    top.pack(fill="x", padx=10, pady=8)  # NEW
-
-    title_lbl = ttk.Label(top, text="")  # NEW
-    title_lbl.pack(side="left")  # NEW
-
-    nav = ttk.Frame(top)  # NEW
-    nav.pack(side="right")  # NEW
-    prev_btn = ttk.Button(nav, text="Prev")  # NEW
-    prev_btn.pack(side="left", padx=(0, 6))  # NEW
-    next_btn = ttk.Button(nav, text="Next")  # NEW
-    next_btn.pack(side="left")  # NEW
-
-    paned = ttk.PanedWindow(win, orient="horizontal")  # NEW
-    paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))  # NEW
-    left = ttk.Frame(paned)  # NEW
-    right = ttk.Frame(paned)  # NEW
-    paned.add(left, weight=1)  # NEW
-    paned.add(right, weight=3)  # NEW
-
-    c = tk.Canvas(left)  # NEW
-    sb = ttk.Scrollbar(left, orient="vertical", command=c.yview)  # NEW
-    c.configure(yscrollcommand=sb.set)  # NEW
-    sb.pack(side="right", fill="y")  # NEW
-    c.pack(side="left", fill="both", expand=True)  # NEW
-    f = ttk.Frame(c)  # NEW
-    w = c.create_window((0, 0), window=f, anchor="nw")  # NEW
-    f.bind("<Configure>", lambda e: c.configure(scrollregion=c.bbox("all")))  # NEW
-    c.bind("<Configure>", lambda e: c.itemconfigure(w, width=e.width))  # NEW
-
-    preview = ScrolledText(right, wrap="word")  # NEW
-    preview.pack(fill="both", expand=True)  # NEW
-    preview.configure(state="disabled")  # NEW
-
-    bottom = ttk.Frame(win)  # NEW
-    bottom.pack(fill="x", padx=10, pady=(0, 10))  # NEW
-    ttk.Label(bottom, text="Ranked URLs (count → url):").pack(anchor="w")  # NEW
-
-    url_row = ttk.Frame(bottom)  # NEW
-    url_row.pack(fill="x")  # NEW
-    url_list = tk.Listbox(url_row, height=7)  # NEW
-    url_list.pack(side="left", fill="both", expand=True)  # NEW
-    url_sb = ttk.Scrollbar(url_row, orient="vertical", command=url_list.yview)  # NEW
-    url_list.configure(yscrollcommand=url_sb.set)  # NEW
-    url_sb.pack(side="left", fill="y")  # NEW
-
-    load_next_btn = ttk.Button(url_row, text="Load next")  # NEW
-    load_next_btn.pack(side="left", padx=10)  # NEW
-
-    footer = ttk.Frame(win)  # NEW
-    footer.pack(fill="x", padx=10, pady=10)  # NEW
-    ok_btn = ttk.Button(footer, text="OK")  # NEW
-    ok_btn.pack(side="right")  # NEW
-
-    cur = {"i": 0}  # NEW
-
-    def render_doc(i: int) -> None:  # NEW
-        cur["i"] = max(0, min(i, len(docs) - 1))  # NEW
-        doc = docs[cur["i"]]  # NEW
-        ensure_keys(doc)  # NEW
-        title_lbl.configure(text=f'{cur["i"]+1}/{len(docs)}  {doc.base_name}')  # NEW
-
-        for child in list(f.winfo_children()):  # NEW
-            child.destroy()  # NEW
-
-        vars_by_key: dict[str, tk.BooleanVar] = {}  # NEW
-
-        def on_toggle(k: str) -> None:  # NEW
-            doc.heading_state[k] = vars_by_key[k].get()  # NEW
-            txt = preview_text(doc)  # NEW
-            preview.configure(state="normal")  # NEW
-            preview.delete("1.0", "end")  # NEW
-            preview.insert("1.0", txt)  # NEW
-            preview.configure(state="disabled")  # NEW
-
-        for k in doc.heading_keys:  # NEW
-            v = tk.BooleanVar(value=doc.heading_state.get(k, True))  # NEW
-            vars_by_key[k] = v  # NEW
-            ttk.Checkbutton(f, text=k, variable=v, command=lambda kk=k: on_toggle(kk)).pack(anchor="w")  # NEW
-
-        url_list.delete(0, "end")  # (unverändert)
-        for u, cnt in seed_doc.urls_ranked:  # CHANGED
-            mark = " [loaded]" if (u in loaded) else ""  # (unverändert)
-            url_list.insert("end", f"{cnt:>4}  {u}{mark}")  # (unverändert)
+def _render_with_state(html: str, state: dict[str, bool]) -> str:  # render plaintext while removing unchecked sections
+    root = _html_to_ET(html)  # parse HTML to lxml tree (fresh tree each time so we can safely modify)
+    heads = _get_headings(root)  # compute headings list (includes your "Intro" injection)
+    keys = [f"{i+1}. {h.text.strip()} (lvl: {h.lvl})" for i, h in enumerate(heads)]  # stable checkbox labels/keys
+    to_remove = [heads[i] for i, k in enumerate(keys) if not state.get(k, True)]  # collect headings that are unchecked => remove
+    ranges = _get_removal_ranges(heads, to_remove)  # convert headings to (start,end) removal ranges
+    for start, end in reversed(ranges): _remove_between(start, end)  # remove ranges back-to-front to keep indices stable
+    _insert_section_markers(root)  # insert SECTION markers AFTER removal so chunking sees only kept sections
+    if keys and not state.get(keys[0], True): root.text = ''  # Intro unchecked => remove marker stored on root element
+    raw = '\n'.join(block.text for block in _get_blocks(root))  # extract blocks from modified tree
+    return _merge_lines(raw)  # merge/clean lines like in your normal pipeline
 
 
-        txt = preview_text(doc)  # NEW
-        preview.configure(state="normal")  # NEW
-        preview.delete("1.0", "end")  # NEW
-        preview.insert("1.0", txt)  # NEW
-        preview.configure(state="disabled")  # NEW
+def process_multiple_docs(base_url: str, base_html: str, title: str, extracted_urls: list[tuple[str, int]], base_metadata, ROOT: str, SILENT: bool) -> list[Doc]:  # GUI that selects websites + sections and returns Docs
+    if SILENT: return [Doc(base_url, title, base_html, html_to_text(title, base_html, ROOT), base_metadata, state=None)]
+    win = tk.Tk()  # Root-Fenster sofort erstellen, damit tk.*Var später erlaubt ist
+    win.title(f"Websites & Sections - {title}")  # Titel setzen
+    win.geometry("1400x800")  # Startgröße setzen
+    win.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))  # X soll das gesamte Programm beenden
 
-    def on_prev() -> None:  # NEW
-        render_doc(cur["i"] - 1)  # NEW
+    state_path = Path(ROOT) / "src/config/section_state.json"  # where section checkbox states are stored
 
-    def on_next() -> None:  # NEW
-        render_doc(cur["i"] + 1)  # NEW
+    def load_state(key: str, keys: list[str]) -> dict[str, bool]:  # load per-document heading state (default all True)
+        state = {k: True for k in keys}  # default: everything enabled
+        if not state_path.exists(): return state  # no file yet => default
+        try: data = json.loads(state_path.read_text(encoding="utf-8") or "{}")  # load JSON dict from disk
+        except: return state  # invalid JSON => behave like empty
+        doc = data.get(key, {}) if isinstance(data, dict) else {}  # per-document sub-dict
+        sects = doc.get('sections', doc) if isinstance(doc, dict) else {}
+        if isinstance(sects, dict): state.update({k: bool(sects.get(k, True)) for k in keys})  # merge stored values for existing keys
+        return state  # return resolved state for this doc
 
-    def on_load_next() -> None:
-        i = seed_next["i"]  # CHANGED
-        while i < len(seed_doc.urls_ranked) and seed_doc.urls_ranked[i][0] in loaded:  # CHANGED
-            i += 1  # (unverändert)
-        seed_next["i"] = i + 1  # CHANGED
-        if i >= len(seed_doc.urls_ranked):  # CHANGED
-            messagebox.showinfo("No more URLs", "No more unseen URLs in this list.")  # (unverändert)
-            return  # (unverändert)
+    def save_state(url: str, site_title: str, state: dict[str, bool]) -> None:  # persist one document's state into section_state.json
+        try: data = json.loads(state_path.read_text(encoding="utf-8") or "{}") if state_path.exists() else {}  # load file if present
+        except: data = {}  # invalid file => overwrite with fresh dict
+        if not isinstance(data, dict): data = {}  # enforce dict root
+        data[url] = {"title": site_title, "sections": state}  # write/replace the document's state
+        state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")  # write back pretty JSON
 
-        url = seed_doc.urls_ranked[i][0]  # CHANGED
-        try:  # (unverändert)
-            new_doc = load_doc_fn(url)  # (unverändert)
-        except Exception as e:  # (unverändert)
-            messagebox.showerror("Load failed", str(e))  # (unverändert)
-            return  # (unverändert)
+    def state_key(meta: dict, url: str) -> str:  # stable key for state: prefer canonical_url, then url
+        md = meta.get("metadata", {}) if isinstance(meta, dict) else {}  # metadata sub-dict
+        return (md.get("canonical_url") or md.get("url") or url)  # canonical best, url fallback
 
-        loaded.add(url)  # (unverändert)
-        if new_doc.canonical_url: loaded.add(new_doc.canonical_url)  # (unverändert)
-        docs.append(new_doc)  # (unverändert)
-        render_doc(len(docs) - 1)  # (unverändert)
+    def init_site(url: str, html: str, title: str, meta: dict) -> None:  # initialize one site entry after download
+        root = _html_to_ET(html)  # parse HTML so we can compute headings for the checkbox list
+        heads = _get_headings(root)  # compute headings list for this HTML
+        keys = [f"{i+1}. {h.text.strip()} (lvl: {h.lvl})" for i, h in enumerate(heads)]  # make the same keys used in the old dialog
+        key = state_key(meta, url)  # compute stable JSON key for this page
+        init = load_state(url, keys)  # load old state or default to all True
+        vars_ = {k: tk.IntVar(master=win, value=(1 if init[k] else 0)) for k in keys}  # 1=checked, 0=unchecked (kein mixed state)
+        sites[url] = {"dl": True, "save": True, "html": html, "title": title, "meta": meta, "key": key, "vars": vars_, "keys": keys}  # store everything for this site
+
+    urls = list(dict.fromkeys([base_url] + [u for u, _ in extracted_urls]))  # unique URL list: base first, then extracted (keep order)
+    sites = {u: {"dl": False, "save": False, "html": "", "title": "", "meta": None, "key": u, "vars": {}, "keys": []} for u in urls}  # in-memory cache per URL
+    init_site(base_url, base_html, title, base_metadata)  # base site is already downloaded by pipeline => init now (loads old state)
+
+    main = ttk.PanedWindow(win, orient="horizontal")  # 3-column layout: websites | sections | preview
+    main.pack(fill="both", expand=True)  # make it fill the window
+
+    left = tk.Frame(main); mid = tk.Frame(main, bg="#d5cece"); right = ttk.Frame(main)  # three panes
+    main.add(left, weight=1); main.add(mid, weight=1); main.add(right, weight=2)  # preview gets more space
+    
+    left_top = ttk.Frame(left)              # oben: buttons
+    left_top.pack(fill="x")                 # nimmt nur die Höhe die nötig ist
+
+    left_body = ttk.Frame(left)             # unten: website-liste
+    left_body.pack(fill="both", expand=True)# nimmt den restlichen Platz
+
+    lb = tk.Listbox(left_body)  # website list widget
+    sb = ttk.Scrollbar(left_body, orient="vertical", command=lb.yview)  # scrollbar for website list
+    lb.configure(yscrollcommand=sb.set)  # connect list to scrollbar
+    lb.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")  # pack list + scrollbar
+    counts = dict(extracted_urls)  # url->count mapping for display (extracted list is already sorted by frequency)
+    for u in urls: lb.insert("end", (f"BASE  {u}" if u == base_url else f"{counts.get(u, 0):>4}  {u}"))  # insert rows (base marked)
+    row_of = {u: i for i, u in enumerate(urls)}  # map url -> listbox row index
+
+    selected = tk.StringVar(master=win, value=base_url)  # aktuell ausgewählte URL an dieses Root binden
+    save_var = tk.BooleanVar(master=win, value=True)  # Save-Checkbox an dieses Root binden
+
+    open_btn = ttk.Button(left_top, text="open in browser")
+    dl_btn = ttk.Button(left_top, text="download selected website")  # download button for current selection
+    save_cb = ttk.Checkbutton(left_top, text="save selected website", variable=save_var)  # checkbox for current site saving
+    open_btn.pack(fill="x"); dl_btn.pack(fill="x"); save_cb.pack(fill="x")
+
+    sect_btns = ttk.Frame(mid)  # kleine Button-Leiste über den Sections
+    sect_btns.pack(fill="x")    # oben in der Mitte platzieren
+
+    canv = tk.Canvas(mid)  # scrollable container for section checkboxes
+    msb = ttk.Scrollbar(mid, orient="vertical", command=canv.yview)  # vertical scroll for section list
+    canv.configure(yscrollcommand=msb.set)  # connect canvas to scrollbar
+    msb.pack(side="right", fill="y"); canv.pack(side="left", fill="both", expand=True)  # pack canvas + scrollbar
+    sect_frame = ttk.Frame(canv)  # actual frame holding checkbuttons
+    sect_win = canv.create_window((0, 0), window=sect_frame, anchor="nw")  # embed frame into canvas
+    sect_frame.bind("<Configure>", lambda e: canv.configure(scrollregion=canv.bbox("all")))  # update scroll region when content changes
+    canv.bind("<Configure>", lambda e: canv.itemconfigure(sect_win, width=e.width))  # keep checkbox width fitting the pane
+
+    preview = ScrolledText(right, wrap="word")  # preview text area (right pane)
+    preview.pack(fill="both", expand=True)  # fill right pane
+    preview.configure(state="disabled")  # read-only: we only show rendered output
+
+    btns = ttk.Frame(win)  # bottom bar with OK
+    btns.pack(fill="x")  # stretch horizontally
+    ok_btn = ttk.Button(btns, text="OK")  # OK saves state + returns docs
+    ok_btn.pack(side="right", padx=10, pady=5)  # put button bottom-right
+
+    result_docs: list[Doc] = []  # list of docs that will be returned to the pipeline
+
+    def mark_all(on: int) -> None:  # on=1 => alles, on=0 => nichts
+        url = current_url()  # aktuelle Website
+        for v in sites[url]["vars"].values(): v.set(on)  # alle Sections setzen
+        render_preview()  # Preview neu rendern (falls set() kein command auslöst)
+
+    ttk.Button(sect_btns, text="Alles markieren", command=lambda: mark_all(1)).pack(side="left", fill="x", expand=True)
+    ttk.Button(sect_btns, text="Nichts markieren", command=lambda: mark_all(0)).pack(side="left", fill="x", expand=True)
 
 
-    def on_ok() -> None:  # NEW
-        for d in docs:  # NEW
-            apply_removals_inplace(d)  # NEW
-            d.final_text = finalize_text(d)  # NEW
-        save_all_states()  # NEW
-        win.destroy()  # NEW
+    def recolor_sites() -> None:  # color rows by export status
+        for u in urls:  # go through all sites
+            i = row_of[u]  # row index for this url
+            bg = "white" if not sites[u]["dl"] else ("green" if sites[u]["save"] else "red")
+            lb.itemconfigure(i, background=bg)  # apply background color to that row
 
-    prev_btn.configure(command=on_prev)  # NEW
-    next_btn.configure(command=on_next)  # NEW
-    load_next_btn.configure(command=on_load_next)  # NEW
-    ok_btn.configure(command=on_ok)  # NEW
+    def current_url() -> str: return selected.get()  # helper to read the selected URL
 
-    def abort() -> None:  # NEW
-        import sys  # NEW
-        sys.exit(0)  # NEW
+    def current_state(url: str) -> dict[str, bool]:  # state dict for JSON + rendering
+        return {k: bool(v.get()) for k, v in sites[url]["vars"].items()}  # IntVar -> bool
 
-    win.protocol("WM_DELETE_WINDOW", abort)  # NEW
-    render_doc(0)  # NEW
-    win.mainloop()  # NEW
-    return docs  # NEW
+    def set_preview(txt: str) -> None:  # write text into preview widget (read-only update)
+        preview.configure(state="normal"); preview.delete("1.0", "end"); preview.insert("1.0", txt); preview.configure(state="disabled")  # atomic replace
+
+    def render_preview(*_) -> None:  # recompute preview text for current URL whenever something changes
+        url = current_url()  # which URL is active in the UI
+        if not sites[url]["dl"]: return set_preview("")  # not downloaded => empty preview
+        return set_preview(_render_with_state(sites[url]["html"], current_state(url)))  # render text after removing unchecked sections
+
+    def rebuild_sections() -> None:  # rebuild the middle pane (section checkbox list) for the current URL
+        for w in sect_frame.winfo_children(): w.destroy()  # clear old checkboxes
+        url = current_url()  # active URL
+        if not sites[url]["dl"]: return render_preview()  # nothing to show if not downloaded
+        for k in sites[url]["keys"]:
+            v = sites[url]["vars"][k]
+            ttk.Checkbutton(sect_frame, text=k, variable=v, command=render_preview).pack(anchor="w")  # click => rerender
+        render_preview()
+
+    def on_select(_=None) -> None:  # handler when user selects another website in the left list
+        sel = lb.curselection()  # current selection indices
+        if not sel: return  # no selection => nothing to do
+        url = urls[sel[0]]  # map listbox index back to URL (same order as insertion)
+        selected.set(url)  # update selected URL variable
+        if not sites[url]["dl"]:  # not loaded in RAM yet
+            html, title = _load_cached_raw(url, ROOT)  # try disk cache ONLY (no download)
+            if html: init_site(url, html, title, extract_metadata(html))  # if cached => load + build section vars
+            save_var.set(False)  # optional: beim Nicht-Download Häkchen rausnehmen
+        save_cb.configure(state=("normal" if sites[url]["dl"] else "disabled"))  # grau wenn nicht downloaded
+
+        save_var.set(bool(sites[url]["save"]))  # show current "save" state of this URL
+        rebuild_sections()  # refresh sections+preview for the newly selected URL
+
+    def on_save_toggle(*_) -> None:  # handler for toggling "save selected website"
+        sites[current_url()]["save"] = save_var.get()  # write checkbox state into our per-site cache
+        recolor_sites()
+
+    def on_download() -> None:  # download button handler for current selection
+        url = current_url()  # current website URL
+        if sites[url]["dl"]: return  # already downloaded => do nothing
+        html, title = download_html(url, ROOT)  # download (no disk write)
+        init_site(url, html, title, extract_metadata(html))  # compute headings, load old state, mark save=True
+        save_var.set(True)  # requirement: downloading auto-enables saving for this website
+        save_cb.configure(state="normal")  # nach Download wieder aktiv
+        recolor_sites()
+        rebuild_sections()  # show sections and preview now that the page exists
+
+    def on_open() -> None:
+        sel = lb.curselection()
+        if sel: webbrowser.open_new_tab(urls[sel[0]])
+
+    def on_ok() -> None:  # OK button: for all marked websites -> save state + return docs
+        for url, info in sites.items():  # iterate through all known URLs
+            if not info["save"]: continue  # only process websites that are marked for saving
+            if not info["dl"]:  # if user marked a site but never downloaded it manually
+                html, title = download_html(url, ROOT)  # download it now so we can process it
+                init_site(url, html, title, extract_metadata(html))  # initialize cache (state loaded, save forced true)
+                info = sites[url]  # refresh local reference after init_site overwrote the dict
+            state = current_state(url)  # grab final section checkbox state from UI vars
+            save_state(url, info['title'], state)  # requirement: store state on OK per marked website
+            txt = _render_with_state(info["html"], state)  # render final text for this website with selected sections
+            result_docs.append(Doc(url=url, title=info["title"], html=info["html"], text=txt, metadata=info["meta"], state=state))  # create output object for pipeline
+        win.destroy()  # close window and return to pipeline (next getURLs.txt window opens)
+
+    lb.bind("<<ListboxSelect>>", on_select)  # connect website selection event
+    save_var.trace_add("write", on_save_toggle)  # connect save checkbox toggles
+    dl_btn.configure(command=on_download)  # connect download button
+    open_btn.configure(command=on_open)
+    ok_btn.configure(command=on_ok)  # connect OK button
+
+    lb.selection_set(0)  # select first row (base URL) by default
+    on_select()  # build initial sections+preview for base URL right away
+    win.mainloop()  # block until window is closed (OK/Abort/X)
+
+    return result_docs  # Abort => nothing; OK => docs for pipeline

@@ -27,7 +27,6 @@ def extract_metadata(html: ET.Element):
             'overlap_char' : -1,
             'content_type' : content_type,
             'content_hash' : '',
-            'url': url,
             'canonical_url': canonical_url,
             'title' : title,
             'site': site,

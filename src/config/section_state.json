@@ -1,0 +1,24 @@
+{
+  "https://en.wikipedia.org/wiki/Mistral_AI": {
+    "title": "Mistral AI - Wikipedia",
+    "sections": {
+      "1. Intro (lvl: 2)": true,
+      "2. Namesake (lvl: 2)": true,
+      "3. History (lvl: 2)": true,
+      "4. Company operation (lvl: 2)": true,
+      "5. Funding (lvl: 3)": true,
+      "6. Partnerships (lvl: 3)": true,
+      "7. Services (lvl: 2)": true,
+      "8. Models (lvl: 2)": true,
+      "9. Mistral 7B (lvl: 3)": true,
+      "10. Mixtral 8x7B (lvl: 3)": true,
+      "11. Mistral Small 3.1 (lvl: 3)": true,
+      "12. Mistral Medium 3 (lvl: 3)": true,
+      "13. Magistral Small and Magistral Medium (lvl: 3)": true,
+      "14. Mistral Large 3 and Ministral 3 (lvl: 3)": true,
+      "15. Devstral 2 and Devstral Small 2 (lvl: 3)": true,
+      "16. Mistral Vibe (lvl: 2)": true,
+      "17. See also (lvl: 2)": true
+    }
+  }
+}

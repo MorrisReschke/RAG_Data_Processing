@@ -29,6 +29,11 @@ SKIP_ID = {
     # optional
     "site-header",
     "page-footer",
+
+    # Wikipedia-specific IDs
+    "centralnotice",            # CentralNotice container (campaign banners like "Wiki Loves Folklore")
+    "sitenotice",               # outer notice wrapper that contains centralNotice
+    "wlf2026-wrapper",          # specific campaign wrapper (optional but cheap)
 }
 # ID prefixes that usually indicate non-content containers
 SKIP_ID_PREFIX = {
