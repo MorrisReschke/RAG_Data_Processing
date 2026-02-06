@@ -1,0 +1,12 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run process_html_files as module",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.process_html_files",
+            "cwd": "${workspaceFolder}"
+        },
+    ]
+}
