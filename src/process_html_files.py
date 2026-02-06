@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 
 ROOT = Path(__file__).resolve().parents[1]
-SILENT = True
+SILENT = False
 
 def run_pipeline():  # main pipeline runner (loops over getURLs.txt)
     for url in _get_urls_to_process():  # process each line in getURLs.txt
