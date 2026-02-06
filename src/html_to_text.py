@@ -1,7 +1,7 @@
-from src.config.filters.filter_attribute import *  # Attribute-based filters
-from src.config.filters.filter_class import *  # Class-based filters
-from src.config.filters.filter_id import *  # ID-based filters
-from src.config.filters.filter_tag import *  # Tag-based filters
+from src.filters.filter_attribute import *  # Attribute-based filters
+from src.filters.filter_class import *  # Class-based filters
+from src.filters.filter_id import *  # ID-based filters
+from src.filters.filter_tag import *  # Tag-based filters
 from src.extract_metadata import extract_metadata  # reuse existing metadata extractor (no reimplementation)
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright
