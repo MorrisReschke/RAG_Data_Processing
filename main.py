@@ -5,7 +5,7 @@ from src.chunking import chunking
 from pathlib import Path
 import json
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[0]
 SILENT = False
 
 def run_pipeline():  # main pipeline runner (loops over getURLs.txt)
@@ -24,7 +24,7 @@ def run_pipeline():  # main pipeline runner (loops over getURLs.txt)
             _write_chunks(doc.title, chunks)  # write jsonl chunks            
             
 def _get_urls_to_process() -> list[str]:
-        url_path = f'{ROOT}/src/config/getURLs.txt'
+        url_path = f'{ROOT}/config/getURLs.txt'
         urls: list[str] = []
         with open(url_path, 'r', encoding='utf-8') as f:
             for ln in f.read().split('\n'): urls.append(ln.strip())

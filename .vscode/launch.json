@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run process_html_files as module",
+            "name": "Run main as module",
             "type": "debugpy",
             "request": "launch",
-            "module": "src.process_html_files",
+            "module": "main",
             "cwd": "${workspaceFolder}"
         },
     ]

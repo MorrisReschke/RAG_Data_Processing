@@ -324,7 +324,7 @@ def download_html(url: str, ROOT: str):  # download a page without writing anyth
     return html, title  # return in-memory only (no disk write here)
 
 def _load_cached_raw(url: str, ROOT: str) -> tuple[str, str]:
-    state_path = Path(ROOT) / "src/config/section_state.json"
+    state_path = Path(ROOT) / "config/section_state.json"
     if not state_path.exists(): return "", ""
     data = json.loads(state_path.read_text(encoding="utf-8") or "{}")
     entry = data.get(url, {})
@@ -356,7 +356,7 @@ def process_multiple_docs(base_url: str, base_html: str, title: str, extracted_u
     win.geometry("1400x800")  # Startgröße setzen
     win.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))  # X soll das gesamte Programm beenden
 
-    state_path = Path(ROOT) / "src/config/section_state.json"  # where section checkbox states are stored
+    state_path = Path(ROOT) / "config/section_state.json"  # where section checkbox states are stored
 
     def load_state(key: str, keys: list[str]) -> dict[str, bool]:  # load per-document heading state (default all True)
         state = {k: True for k in keys}  # default: everything enabled
