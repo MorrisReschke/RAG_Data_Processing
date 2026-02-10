@@ -12,27 +12,22 @@ from lxml import etree as ET
 from typing import Iterable
 import re, webbrowser, sys, json, tkinter as tk
 
-_PROJECT_ROOT = ''
-_TITLE = ''  # global document title for section removal dialog
 _WHITESPACE = re.compile(r'\s+')  # regex to match whitespace sequences
+
+@dataclass  # simple container for one processed website (what the pipeline will write + chunk)
+class Doc:  # returned objects from the GUI flow into process_html_files.py
+    url: str  # the page URL (identity / debug / printing)
+    title: str  # title used as directory + file prefix by your pipeline
+    html: str  # raw HTML content (written as *_input.txt by the pipeline)
+    text: str  # final plaintext (written as *_output.txt and chunked)
+    metadata: dict[str, any]  # your metadata dict as produced by extract_metadata()
+    state: dict[str, bool]  # per-section checkbox state saved to section_state.json
 
 @dataclass(frozen=True)
 class Node:
     node : ET.Element  # reference to the element
     text : str  # extracted text
     lvl : int = 0  # heading level, 0 if not a heading
-
-def html_to_text(doc_title: str, html: str, project_root) -> str:
-    '''main function: HMTL -> Plaintext'''
-    global _TITLE; _TITLE = doc_title
-    global _PROJECT_ROOT; _PROJECT_ROOT = project_root
-    if not html: return ''
-    root = _html_to_ET(html)  # create lxml tree
-    _insert_section_markers(root)
-    raw = '\n'.join(block.text for block in _get_blocks(root))  # extract text blocks and join
-    clean_txt = _merge_lines(raw)
-    return clean_txt
-
 
 def _html_to_ET(html: str) -> ET.Element:
     '''creates a correct working lxml tree'''
@@ -287,14 +282,7 @@ def _insert_section_markers(root: ET.Element) -> None:
         h.node.text = f'<<<SECTION: {h.text}; level: {h.lvl}>>>'  # insert marker
 
 
-@dataclass  # simple container for one processed website (what the pipeline will write + chunk)
-class Doc:  # returned objects from the GUI flow into process_html_files.py
-    url: str  # the page URL (identity / debug / printing)
-    title: str  # title used as directory + file prefix by your pipeline
-    html: str  # raw HTML content (written as *_input.txt by the pipeline)
-    text: str  # final plaintext (written as *_output.txt and chunked)
-    metadata: dict[str, any]  # your metadata dict as produced by extract_metadata()
-    state: dict[str, bool]  # per-section checkbox state saved to section_state.json
+
 
 def download_html(url: str, ROOT: str):  # download a page without writing anything to disk (Abort must not write)
     _WIN_RESERVED = {  # these stuff cant be in name for dictionary or file on windows
@@ -336,21 +324,22 @@ def _load_cached_raw(url: str, ROOT: str) -> tuple[str, str]:
         else: return '', ''
     return '', ''
 
-def _render_with_state(html: str, state: dict[str, bool]) -> str:  # render plaintext while removing unchecked sections
+def _render_with_state(html: str, state: dict[str, bool] = None) -> str:  # render plaintext while removing unchecked sections
     root = _html_to_ET(html)  # parse HTML to lxml tree (fresh tree each time so we can safely modify)
-    heads = _get_headings(root)  # compute headings list (includes your "Intro" injection)
+    heads = _get_headings(root)  # compute headings list
     keys = [f"{i+1}. {h.text.strip()} (lvl: {h.lvl})" for i, h in enumerate(heads)]  # stable checkbox labels/keys
-    to_remove = [heads[i] for i, k in enumerate(keys) if not state.get(k, True)]  # collect headings that are unchecked => remove
-    ranges = _get_removal_ranges(heads, to_remove)  # convert headings to (start,end) removal ranges
-    for start, end in reversed(ranges): _remove_between(start, end)  # remove ranges back-to-front to keep indices stable
+    if state is not None: 
+        to_remove = [heads[i] for i, k in enumerate(keys) if not state.get(k, True)]  # collect headings that are unchecked => remove
+        ranges = _get_removal_ranges(heads, to_remove)  # convert headings to (start,end) removal ranges
+        for start, end in reversed(ranges): _remove_between(start, end)  # remove ranges back-to-front to keep indices stable
+        if keys and not state.get(keys[0], True): root.text = ''  # Intro unchecked => remove marker stored on root element
     _insert_section_markers(root)  # insert SECTION markers AFTER removal so chunking sees only kept sections
-    if keys and not state.get(keys[0], True): root.text = ''  # Intro unchecked => remove marker stored on root element
     raw = '\n'.join(block.text for block in _get_blocks(root))  # extract blocks from modified tree
     return _merge_lines(raw)  # merge/clean lines like in your normal pipeline
 
 
-def process_multiple_docs(base_url: str, base_html: str, title: str, extracted_urls: list[tuple[str, int]], base_metadata, ROOT: str, SILENT: bool) -> list[Doc]:  # GUI that selects websites + sections and returns Docs
-    if SILENT: return [Doc(base_url, title, base_html, html_to_text(title, base_html, ROOT), base_metadata, state=None)]
+def process_multiple_docs(base_url: str, base_html: str, title: str, extracted_urls: list[tuple[str, int]], chunk_template, ROOT: str, SILENT: bool) -> list[Doc]:  # GUI that selects websites + sections and returns Docs
+    if SILENT: return [Doc(base_url, title, base_html, _render_with_state(base_html), chunk_template, state=None)]
     win = tk.Tk()  # Root-Fenster sofort erstellen, damit tk.*Var später erlaubt ist
     win.title(f"Websites & Sections - {title}")  # Titel setzen
     win.geometry("1400x800")  # Startgröße setzen
@@ -390,7 +379,7 @@ def process_multiple_docs(base_url: str, base_html: str, title: str, extracted_u
 
     urls = list(dict.fromkeys([base_url] + [u for u, _ in extracted_urls]))  # unique URL list: base first, then extracted (keep order)
     sites = {u: {"dl": False, "save": False, "html": "", "title": "", "meta": None, "key": u, "vars": {}, "keys": []} for u in urls}  # in-memory cache per URL
-    init_site(base_url, base_html, title, base_metadata)  # base site is already downloaded by pipeline => init now (loads old state)
+    init_site(base_url, base_html, title, chunk_template)  # base site is already downloaded by pipeline => init now (loads old state)
 
     main = ttk.PanedWindow(win, orient="horizontal")  # 3-column layout: websites | sections | preview
     main.pack(fill="both", expand=True)  # make it fill the window

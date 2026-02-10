@@ -1,0 +1,809 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional, Tuple, List, Dict
+import json
+import re
+import sys
+import webbrowser
+import tkinter as tk
+from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+
+from lxml import etree as ET
+from playwright.sync_api import sync_playwright
+
+# Filters (provided by your project)
+from src.filters.filter_attribute import *  # noqa: F403
+from src.filters.filter_class import *  # noqa: F403
+from src.filters.filter_id import *  # noqa: F403
+from src.filters.filter_tag import *  # noqa: F403
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_SECTION_PREFIX = "<<<SECTION: "
+_SECTION_SUFFIX = ">>>"
+
+# -----------------------------------------------------------------------------
+# Public output container
+# -----------------------------------------------------------------------------
+
+@dataclass
+class Doc:
+    """One processed website (used by main.py).
+
+    url:     Identity of the page (also used for section_state.json key)
+    title:   Safe title used as folder / filename prefix
+    html:    Raw HTML (pipeline writes *_raw.html)
+    text:    Final plaintext (pipeline writes *_output.txt and chunks it)
+    metadata: Metadata dict as produced by extract_metadata()
+    state:   Checkbox state for sections (None in SILENT mode)
+    """
+
+    url: str
+    title: str
+    html: str
+    text: str
+    metadata: dict
+    state: Optional[Dict[str, bool]] = None
+
+
+# -----------------------------------------------------------------------------
+# Public: HTML -> Plaintext (optionally applying a section_state)
+# -----------------------------------------------------------------------------
+
+def extract_text(
+    doc_title: str,
+    html: str,
+    project_root,
+    *,
+    section_state: Optional[Dict[str, bool]] = None,
+    return_section_keys: bool = False,
+):
+    """HTML -> plaintext.
+
+    - Inserts SECTION markers before extraction (so chunking.py can split by headings).
+    - If section_state is given, unchecked sections are removed from the DOM first.
+
+    Backwards compatible: callers that expect a string still get a string.
+    If return_section_keys=True: returns (text, keys).
+    """
+    # NOTE: doc_title / project_root are kept for compatibility with existing callers.
+    #       The current implementation does not need them for extraction.
+    _ = (doc_title, project_root)
+
+    if not html:
+        return ("", []) if return_section_keys else ""
+
+    # -----------------------------
+    # Local helpers (kept inside for readability and to avoid a split helper style)
+    # -----------------------------
+
+    @dataclass(frozen=True)
+    class Heading:
+        node: ET.Element
+        text: str
+        lvl: int
+
+    def parse_html_to_root(raw_html: str) -> ET.Element:
+        import html5lib  # local import (only needed when we parse)
+        doc = html5lib.parse(raw_html, treebuilder="lxml", namespaceHTMLElements=False)
+        return doc.getroot()
+
+    def tag_of(node: ET.Element) -> str:
+        return node.tag.lower() if isinstance(node.tag, str) else ""
+
+    def normalize_whitespace(text: str, *, multiline: bool = False) -> str:
+        def clean(s: str) -> str:
+            return _WHITESPACE_RE.sub(" ", s).strip()
+
+        if not multiline:
+            return clean(text)
+
+        lines = (clean(line) for line in text.splitlines())
+        return "\n".join(line for line in lines if line)
+
+    def should_skip_node(node: ET.Element) -> bool:
+        tag = tag_of(node)
+        if not tag:
+            return True
+
+        attr = node.attrib
+
+        def skip_by_tag() -> bool:
+            return tag in SKIP_TAG  # noqa: F405
+
+        def skip_by_class() -> bool:
+            classes = attr.get("class")
+            if not isinstance(classes, str):
+                return False
+            for c in classes.strip().lower().split():
+                if c in SKIP_CLASS:  # noqa: F405
+                    return True
+                if any(c.startswith(p) for p in SKIP_CLASS_PREFIX):  # noqa: F405
+                    return True
+                if any(substr in c for substr in SKIP_CLASS_CONTAINS):  # noqa: F405
+                    return True
+            return False
+
+        def skip_by_attr() -> bool:
+            for name, value in attr.items():
+                if isinstance(name, str):
+                    n = name.strip().lower()
+                    if n in SKIP_ATTR:  # noqa: F405
+                        return True
+                    if any(n.startswith(p) for p in SKIP_ATTR_PREFIX):  # noqa: F405
+                        return True
+                    if any(substr in n for substr in SKIP_ATTR_NAME_CONTAINS):  # noqa: F405
+                        return True
+                if isinstance(value, str):
+                    v = value.strip().lower()
+                    if any(substr in v for substr in SKIP_ATTR_VALUE_CONTAINS):  # noqa: F405
+                        return True
+
+            hidden = attr.get("aria-hidden")
+            return isinstance(hidden, str) and hidden.strip().lower() == "true"
+
+        def skip_by_id() -> bool:
+            id_val = attr.get("id")
+            if not isinstance(id_val, str):
+                return False
+            i = id_val.strip().lower()
+            if i in SKIP_ID:  # noqa: F405
+                return True
+            if any(i.startswith(p) for p in SKIP_ID_PREFIX):  # noqa: F405
+                return True
+            if any(substr in i for substr in SKIP_ID_CONTAINS):  # noqa: F405
+                return True
+            return False
+
+        return skip_by_tag() or skip_by_class() or skip_by_attr() or skip_by_id()
+
+    def clear_text(node: ET.Element) -> str:
+        """Extract plain text from node subtree (skipping filtered nodes)."""
+
+        def has_linebreak_child(n: ET.Element) -> bool:
+            return any(
+                (not should_skip_node(child)) and (tag_of(child) in BREAK_TAGS)  # noqa: F405
+                for child in n
+            )
+
+        def iter_text_parts(n: ET.Element) -> Iterable[str]:
+            if should_skip_node(n):
+                return
+            if n.text:
+                yield n.text
+            for child in n:
+                if not should_skip_node(child):
+                    yield from iter_text_parts(child)
+                if child.tail:
+                    yield child.tail
+
+        if not tag_of(node):
+            return ""
+
+        parts = list(iter_text_parts(node))
+        multiline = has_linebreak_child(node)
+        sep = "\n" if multiline else " "
+        return normalize_whitespace(sep.join(parts), multiline=multiline)
+
+    def get_table_text(table_node: ET.Element) -> str:
+        """Turn simple <table> into readable lines: 'Header: Value; ...'."""
+        headers: List[str] = []
+        out_lines: List[str] = []
+
+        for elem in table_node.iter():
+            if tag_of(elem) == "thead":
+                headers = []
+                for th in elem.iter():
+                    if tag_of(th) == "th":
+                        t = clear_text(th)
+                        if t:
+                            headers.append(t.strip())
+                continue
+
+            if not headers:
+                continue
+
+            if tag_of(elem) == "tr":
+                row_parts: List[str] = []
+                col_idx = 0
+                for td in elem.iter():
+                    if tag_of(td) != "td":
+                        continue
+                    cell = clear_text(td)
+                    if not cell or cell == "?":
+                        col_idx += 1
+                        continue
+                    prefix = f"{headers[col_idx]}: " if col_idx < len(headers) else ""
+                    row_parts.append(prefix + cell)
+                    col_idx += 1
+
+                if not row_parts:
+                    continue
+                row_txt = "; ".join(row_parts).strip()
+                if not row_txt.endswith((".", "!", "?", ":", ";", '"', "“", "‘")):
+                    row_txt += "."
+                out_lines.append(row_txt)
+
+        return "\n".join(out_lines).strip()
+
+    def get_blocks(node: ET.Element) -> Iterable[str]:
+        """Recursive DOM walk yielding readable blocks."""
+        if should_skip_node(node):
+            return
+
+        t = tag_of(node)
+
+        # Special-case tables
+        if t == "table":
+            table_txt = get_table_text(node)
+            if table_txt:
+                yield table_txt
+            return
+
+        # Stop recursion at block-level tags (prevents duplicates)
+        if t in BLOCK_TAG:  # noqa: F405
+            block_txt = clear_text(node)
+            if block_txt:
+                yield block_txt
+            return
+
+        if node.text:
+            before = normalize_whitespace(node.text)
+            if before:
+                yield before
+
+        for child in node:
+            yield from get_blocks(child)
+            if child.tail:
+                tail = normalize_whitespace(child.tail)
+                if tail:
+                    yield tail
+
+    def heading_level(node: ET.Element) -> Optional[int]:
+        t = tag_of(node)
+        if len(t) == 2 and t.startswith("h") and t[-1].isdigit():
+            return int(t[-1])
+
+        role = node.attrib.get("role")
+        if isinstance(role, str) and role.strip().lower() == "heading":
+            aria_level = node.attrib.get("aria-level")
+            if isinstance(aria_level, str) and aria_level.strip().isdigit():
+                return int(aria_level.strip())
+        return None
+
+    def iter_visible_nodes(node: ET.Element) -> Iterable[ET.Element]:
+        if should_skip_node(node):
+            return
+        yield node
+        for child in node:
+            yield from iter_visible_nodes(child)
+
+    def get_headings(root: ET.Element) -> List[Heading]:
+        headings: List[Heading] = []
+        for node in iter_visible_nodes(root):
+            lvl = heading_level(node)
+            if lvl is None:
+                continue
+            txt = clear_text(node)
+            if not txt:
+                continue
+            headings.append(Heading(node=node, text=txt, lvl=lvl))
+
+        first_lvl = headings[0].lvl if headings else 99
+        headings.insert(0, Heading(node=root, text="Intro", lvl=first_lvl))
+        return headings
+
+    def section_key(index: int, heading: Heading) -> str:
+        return f"{index + 1}. {heading.text.strip()} (lvl: {heading.lvl})"
+
+    def removal_ranges(heads: List[Heading], remove_set: set[Heading]) -> List[Tuple[ET.Element, Optional[ET.Element]]]:
+        ranges: List[Tuple[ET.Element, Optional[ET.Element]]] = []
+        converted_until = -1
+
+        for i, start in enumerate(heads):
+            if i < converted_until:
+                continue
+            if start not in remove_set:
+                continue
+
+            end_node: Optional[ET.Element] = None
+            for j in range(i + 1, len(heads)):
+                nxt = heads[j]
+                if nxt.lvl <= start.lvl and nxt not in remove_set:
+                    end_node = nxt.node
+                    converted_until = j
+                    break
+
+            ranges.append((start.node, end_node))
+
+        return ranges
+
+    def remove_nodes_between(start: ET.Element, end: Optional[ET.Element]) -> None:
+        """Remove nodes from start (inclusive) to end (exclusive)."""
+        root = start.getroottree().getroot()
+        nodes = list(root.iter())
+
+        if start not in nodes:
+            return
+        if end is not None and end not in nodes:
+            return
+
+        start_idx = nodes.index(start)
+        end_idx = nodes.index(end) if end is not None else len(nodes)
+        if end is not None and end_idx <= start_idx:
+            return
+
+        protected = (set(end.iterancestors()) | {end}) if end is not None else set()
+
+        for n in reversed(nodes[start_idx:end_idx]):
+            if n in protected:
+                continue
+            parent = n.getparent()
+            if parent is not None:
+                parent.remove(n)
+
+    def insert_section_markers(root: ET.Element) -> None:
+        for h in get_headings(root):
+            h.node.text = f"{_SECTION_PREFIX}{h.text}; level: {h.lvl}{_SECTION_SUFFIX}"
+
+    def merge_lines(text: str) -> str:
+        open_brackets = ("(", "[", "{")
+        close_brackets = (")", "]", "}")
+        symbols_only = re.compile(r"^[\W_]+$")  # line consists only of symbols
+
+        out: List[str] = []
+        collecting_bracket = False
+        bracket_buf = ""
+        append_next = False
+
+        for line in text.splitlines():
+            if not line:
+                continue
+
+            if collecting_bracket:
+                bracket_buf += line
+                if line.endswith(close_brackets):
+                    out.append(bracket_buf)
+                    collecting_bracket = False
+                    bracket_buf = ""
+                continue
+
+            if line.endswith(open_brackets):
+                prev = out.pop() if out else ""
+                bracket_buf = (prev + " " if prev else "") + line
+                collecting_bracket = True
+                continue
+
+            if append_next and out:
+                out[-1] += " " + line
+                append_next = False
+                continue
+
+            if symbols_only.match(line) and out:
+                out[-1] += line
+                append_next = True
+            else:
+                out.append(line)
+
+            if line.endswith(":"):
+                append_next = True
+
+        if collecting_bracket and bracket_buf:
+            out.append(bracket_buf)
+
+        merged = "\n".join(out)
+        merged = re.sub(r"\s+(?=[)\]},;\.:])", "", merged)  # space before closing punctuation
+        merged = re.sub(r"([([{])\s+", r"\1", merged)  # space after opening punctuation
+        return merged
+
+    # -----------------------------
+    # Core extraction
+    # -----------------------------
+
+    root = parse_html_to_root(html)
+
+    headings = get_headings(root)
+    keys = [section_key(i, h) for i, h in enumerate(headings)]
+
+    if section_state is not None:
+        remove_set = {headings[i] for i, k in enumerate(keys) if not section_state.get(k, True)}
+        for start_node, end_node in reversed(removal_ranges(headings, remove_set)):
+            remove_nodes_between(start_node, end_node)
+
+    # IMPORTANT: markers must be inserted after removal so chunking sees only kept sections
+    insert_section_markers(root)
+
+    # If Intro is unchecked, remove the marker stored on the root element (same behavior as before)
+    if keys and section_state is not None and not section_state.get(keys[0], True):
+        root.text = ""
+
+    raw = "\n".join(get_blocks(root))
+    text = merge_lines(raw)
+
+    return (text, keys) if return_section_keys else text
+
+
+# -----------------------------------------------------------------------------
+# Public: download HTML (with optional cache-only behavior)
+# -----------------------------------------------------------------------------
+
+def download_html(url: str, ROOT: str, *, allow_network: bool = True) -> Tuple[str, str]:
+    """Download a page (Playwright) without writing to disk.
+
+    - First tries to load cached raw HTML based on config/section_state.json.
+    - If allow_network=False: cache-only mode (returns ('','') if not cached).
+    """
+
+    WIN_RESERVED = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+
+    def safe_windows_name(name: str, fallback: str = "untitled") -> str:
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+        name = name.strip().strip(" .")
+        name = re.sub(r"\s+", " ", name)
+        if name.upper() in WIN_RESERVED:
+            name = "_" + name
+        name = name[:80].rstrip(" .")
+        return name or fallback
+
+    def load_cached_raw(cache_url: str) -> Tuple[str, str]:
+        state_path = Path(ROOT) / "config/section_state.json"
+        if not state_path.exists():
+            return "", ""
+
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return "", ""
+
+        entry = data.get(cache_url, {}) if isinstance(data, dict) else {}
+        if not isinstance(entry, dict):
+            return "", ""
+
+        title = entry.get("title", "")
+        if not title:
+            return "", ""
+
+        raw_path = Path(ROOT) / "data" / title / f"{title}_raw.html"
+        if not raw_path.exists():
+            return "", ""
+
+        return raw_path.read_text(encoding="utf-8"), title
+
+    cached_html, cached_title = load_cached_raw(url)
+    if cached_html:
+        return cached_html, cached_title
+
+    if not allow_network:
+        return "", ""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(channel="msedge", headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle")
+        title = safe_windows_name(page.title())
+        html = page.content()
+        browser.close()
+
+    return html, title
+
+
+# -----------------------------------------------------------------------------
+# Public: GUI flow to select websites + sections, then return list[Doc]
+# -----------------------------------------------------------------------------
+
+def process_multiple_docs(
+    base_url: str,
+    base_html: str,
+    title: str,
+    extracted_urls: list[tuple[str, int]],
+    chunk_template,
+    ROOT: str,
+    SILENT: bool,
+) -> list[Doc]:
+    """GUI that selects websites + sections and returns Docs for the pipeline."""
+
+    # SILENT = no GUI: keep behavior (no state applied)
+    if SILENT:
+        text = extract_text(title, base_html, ROOT)
+        return [Doc(url=base_url, title=title, html=base_html, text=text, metadata=chunk_template, state=None)]
+
+    # Local import: only needed for GUI flow
+    from src.extract_metadata import extract_metadata
+
+    state_path = Path(ROOT) / "config/section_state.json"
+
+    @dataclass
+    class SiteEntry:
+        url: str
+        downloaded: bool = False
+        save: bool = False
+        html: str = ""
+        title: str = ""
+        meta: Optional[dict] = None
+        section_keys: List[str] = None
+        vars: Dict[str, tk.IntVar] = None
+
+    def read_state_file() -> dict:
+        if not state_path.exists():
+            return {}
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8") or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def load_section_state(url: str, keys: List[str]) -> Dict[str, bool]:
+        state = {k: True for k in keys}
+        data = read_state_file()
+        entry = data.get(url, {})
+        if isinstance(entry, dict):
+            sections = entry.get("sections", entry)
+            if isinstance(sections, dict):
+                for k in keys:
+                    state[k] = bool(sections.get(k, True))
+        return state
+
+    def save_section_state(url: str, site_title: str, state: Dict[str, bool]) -> None:
+        data = read_state_file()
+        data[url] = {"title": site_title, "sections": state}
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def cache_only_load(url: str) -> Tuple[str, str]:
+        # Reuse download_html in cache-only mode (keeps the cache logic in one place)
+        return download_html(url, ROOT, allow_network=False)
+
+    def init_site(url: str, html: str, site_title: str, meta: dict, *, mark_save: bool) -> None:
+        # Compute section keys with the same logic as extraction (stable state keys!)
+        _, keys = extract_text(site_title, html, ROOT, return_section_keys=True)
+        persisted = load_section_state(url, keys)
+
+        vars_ = {k: tk.IntVar(master=win, value=(1 if persisted[k] else 0)) for k in keys}
+        sites[url] = SiteEntry(
+            url=url,
+            downloaded=True,
+            save=mark_save,
+            html=html,
+            title=site_title,
+            meta=meta,
+            section_keys=keys,
+            vars=vars_,
+        )
+
+    # -----------------------------
+    # Build URL list + initial cache
+    # -----------------------------
+
+    urls: List[str] = list(dict.fromkeys([base_url] + [u for u, _ in extracted_urls]))
+    url_counts = dict(extracted_urls)
+
+    sites: Dict[str, SiteEntry] = {u: SiteEntry(url=u) for u in urls}
+    init_site(base_url, base_html, title, chunk_template, mark_save=True)
+
+    # -----------------------------
+    # UI layout
+    # -----------------------------
+
+    win = tk.Tk()
+    win.title(f"Websites & Sections - {title}")
+    win.geometry("1400x800")
+    win.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
+
+    paned = ttk.PanedWindow(win, orient="horizontal")
+    paned.pack(fill="both", expand=True)
+
+    left = tk.Frame(paned)
+    middle = tk.Frame(paned, bg="#d5cece")
+    right = ttk.Frame(paned)
+    paned.add(left, weight=1)
+    paned.add(middle, weight=1)
+    paned.add(right, weight=2)
+
+    # Left: website list + controls
+    left_top = ttk.Frame(left)
+    left_top.pack(fill="x")
+    left_body = ttk.Frame(left)
+    left_body.pack(fill="both", expand=True)
+
+    lb = tk.Listbox(left_body)
+    sb = ttk.Scrollbar(left_body, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    lb.pack(side="left", fill="both", expand=True)
+    sb.pack(side="right", fill="y")
+
+    for u in urls:
+        label = f"BASE  {u}" if u == base_url else f"{url_counts.get(u, 0):>4}  {u}"
+        lb.insert("end", label)
+
+    row_of = {u: i for i, u in enumerate(urls)}
+
+    selected_url = tk.StringVar(master=win, value=base_url)
+    save_current_site = tk.BooleanVar(master=win, value=True)
+
+    open_btn = ttk.Button(left_top, text="open in browser")
+    dl_btn = ttk.Button(left_top, text="download selected website")
+    save_cb = ttk.Checkbutton(left_top, text="save selected website", variable=save_current_site)
+    open_btn.pack(fill="x")
+    dl_btn.pack(fill="x")
+    save_cb.pack(fill="x")
+
+    # Middle: section checkboxes (scrollable)
+    sect_btns = ttk.Frame(middle)
+    sect_btns.pack(fill="x")
+
+    canv = tk.Canvas(middle)
+    msb = ttk.Scrollbar(middle, orient="vertical", command=canv.yview)
+    canv.configure(yscrollcommand=msb.set)
+    msb.pack(side="right", fill="y")
+    canv.pack(side="left", fill="both", expand=True)
+
+    sect_frame = ttk.Frame(canv)
+    sect_win = canv.create_window((0, 0), window=sect_frame, anchor="nw")
+    sect_frame.bind("<Configure>", lambda e: canv.configure(scrollregion=canv.bbox("all")))
+    canv.bind("<Configure>", lambda e: canv.itemconfigure(sect_win, width=e.width))
+
+    # Right: preview
+    preview = ScrolledText(right, wrap="word")
+    preview.pack(fill="both", expand=True)
+    preview.configure(state="disabled")
+
+    # Bottom: OK
+    bottom = ttk.Frame(win)
+    bottom.pack(fill="x")
+    ok_btn = ttk.Button(bottom, text="OK")
+    ok_btn.pack(side="right", padx=10, pady=5)
+
+    result_docs: List[Doc] = []
+
+    # -----------------------------
+    # UI helpers (ordered by usage)
+    # -----------------------------
+
+    def get_current_url() -> str:
+        return selected_url.get()
+
+    def get_site(url: str) -> SiteEntry:
+        return sites[url]
+
+    def current_section_state(url: str) -> Dict[str, bool]:
+        site = get_site(url)
+        return {k: bool(v.get()) for k, v in (site.vars or {}).items()}
+
+    def set_preview_text(text: str) -> None:
+        preview.configure(state="normal")
+        preview.delete("1.0", "end")
+        preview.insert("1.0", text)
+        preview.configure(state="disabled")
+
+    def recolor_sites() -> None:
+        for u in urls:
+            site = get_site(u)
+            bg = "white" if not site.downloaded else ("green" if site.save else "red")
+            lb.itemconfigure(row_of[u], background=bg)
+
+    def render_preview(*_) -> None:
+        site = get_site(get_current_url())
+        if not site.downloaded:
+            set_preview_text("")
+            return
+        state = current_section_state(site.url)
+        text = extract_text(site.title, site.html, ROOT, section_state=state)
+        set_preview_text(text)
+
+    def rebuild_sections() -> None:
+        for w in sect_frame.winfo_children():
+            w.destroy()
+
+        site = get_site(get_current_url())
+        if not site.downloaded:
+            render_preview()
+            return
+
+        for k in site.section_keys:
+            v = site.vars[k]
+            ttk.Checkbutton(sect_frame, text=k, variable=v, command=render_preview).pack(anchor="w")
+
+        render_preview()
+
+    def mark_all(on: int) -> None:
+        site = get_site(get_current_url())
+        if not site.downloaded:
+            return
+        for v in site.vars.values():
+            v.set(on)
+        render_preview()
+
+    ttk.Button(sect_btns, text="Alles markieren", command=lambda: mark_all(1)).pack(side="left", fill="x", expand=True)
+    ttk.Button(sect_btns, text="Nichts markieren", command=lambda: mark_all(0)).pack(side="left", fill="x", expand=True)
+
+    # -----------------------------
+    # Event handlers (ordered by UI flow)
+    # -----------------------------
+
+    def on_select(_=None) -> None:
+        sel = lb.curselection()
+        if not sel:
+            return
+
+        url = urls[sel[0]]
+        selected_url.set(url)
+
+        site = get_site(url)
+        if not site.downloaded:
+            cached_html, cached_title = cache_only_load(url)
+            if cached_html:
+                init_site(url, cached_html, cached_title, extract_metadata(cached_html), mark_save=False)
+
+        site = get_site(url)  # refresh
+        save_cb.configure(state=("normal" if site.downloaded else "disabled"))
+        save_current_site.set(bool(site.save))
+
+        rebuild_sections()
+
+    def on_save_toggle(*_) -> None:
+        url = get_current_url()
+        sites[url].save = bool(save_current_site.get())
+        recolor_sites()
+
+    def on_download() -> None:
+        url = get_current_url()
+        site = get_site(url)
+        if site.downloaded:
+            return
+
+        html, site_title = download_html(url, ROOT)
+        init_site(url, html, site_title, extract_metadata(html), mark_save=True)
+
+        save_cb.configure(state="normal")
+        save_current_site.set(True)
+        recolor_sites()
+        rebuild_sections()
+
+    def on_open() -> None:
+        sel = lb.curselection()
+        if sel:
+            webbrowser.open_new_tab(urls[sel[0]])
+
+    def on_ok() -> None:
+        for url, site in sites.items():
+            if not site.save:
+                continue
+
+            if not site.downloaded:
+                html, site_title = download_html(url, ROOT)
+                init_site(url, html, site_title, extract_metadata(html), mark_save=True)
+                site = sites[url]
+
+            state = current_section_state(url)
+            save_section_state(url, site.title, state)
+
+            text = extract_text(site.title, site.html, ROOT, section_state=state)
+            result_docs.append(
+                Doc(url=url, title=site.title, html=site.html, text=text, metadata=site.meta, state=state)
+            )
+
+        win.destroy()
+
+    # -----------------------------
+    # Wire events + run
+    # -----------------------------
+
+    lb.bind("<<ListboxSelect>>", on_select)
+    save_current_site.trace_add("write", on_save_toggle)
+    dl_btn.configure(command=on_download)
+    open_btn.configure(command=on_open)
+    ok_btn.configure(command=on_ok)
+
+    recolor_sites()
+    lb.selection_set(0)
+    on_select()
+    win.mainloop()
+
+    return result_docs

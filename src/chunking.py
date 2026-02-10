@@ -1,5 +1,6 @@
 import re, copy
 from dataclasses import dataclass
+from colorama import Fore, Style
 MARKER_PREFIX = '<<<SECTION: '
 MARKER_SUFFIX = '>>>'
 MAX_CHUNK_LENGTH = 200
@@ -12,7 +13,7 @@ class Section:
     text : str = ''
     got_split : bool = False
 
-def chunking(base_name: str, text: str, meta_default: dict[str, any]):
+def chunking(text: str, chunk_template: dict[str, any]):
     '''chunks the text into sections based on markers and writes to JSONL'''
     def _get_content_hash(text: str) -> str:
         import hashlib
@@ -60,8 +61,8 @@ def chunking(base_name: str, text: str, meta_default: dict[str, any]):
     for i, txt in enumerate(chunk_txt):
         if not txt: continue
         content_hash = _get_content_hash(txt)
-        nxt_line = copy.deepcopy(meta_default)  # new default line
-        nxt_line['id'] = meta_default['id'] + str(i)
+        nxt_line = copy.deepcopy(chunk_template)  # new default line
+        nxt_line['id'] = chunk_template['id'] + str(i)
         nxt_line['text'] = txt.strip()
         nxt_line['metadata']['headings'] = [{'heading': s.heading, 'lvl': s.lvl, 'got_split': s.got_split} for s in sects_in_chunk[i]]
         nxt_line['metadata']['chunk_index'] = i
@@ -70,9 +71,10 @@ def chunking(base_name: str, text: str, meta_default: dict[str, any]):
         char_pos += len(txt.strip())
         nxt_line['metadata']['end_char'] = char_pos
         nxt_line['metadata']['overlap_char'] = overlap
-        if len(_get_sentences(txt)) < 2: raise Exception('Overlap is not possible. Probably because MAX_CHUNK_LENGTH is too low.')
-        overlap = len(_get_sentences(txt)[-2] + ' ' + _get_sentences(txt)[-1])
-        char_pos -= overlap
+        if len(_get_sentences(txt)) >= 2: 
+            overlap = len(_get_sentences(txt)[-2] + ' ' + _get_sentences(txt)[-1])
+            char_pos -= overlap
+        else: print(Fore.YELLOW + 'WARNING: Overlap is not possible. Probably because MAX_CHUNK_LENGTH is too low or text is too short' + Style.RESET_ALL)
         nxt_line['metadata']['content_hash'] = content_hash
         out.append(nxt_line)
     return out

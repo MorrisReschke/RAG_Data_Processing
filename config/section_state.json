@@ -20,5 +20,19 @@
       "16. Mistral Vibe (lvl: 2)": true,
       "17. See also (lvl: 2)": true
     }
+  },
+  "https://www.technoteam.de/": {
+    "title": "TechnoTeam Bildverarbeitung GmbH _ High precision photometry and vision",
+    "sections": {
+      "1. Intro (lvl: 4)": true,
+      "2. Imaging Photometer/Colorimeter (lvl: 4)": true,
+      "3. Goniophotometer RiGO801 (lvl: 4)": true,
+      "4. Display Metrology (lvl: 4)": true,
+      "5. Screen Photometry (lvl: 4)": true,
+      "6. Applications (lvl: 4)": true,
+      "7. Contact (lvl: 4)": true,
+      "8. TechnoTeam & Joya Team: Metrology Solutions for Next-Generation XR Devices (lvl: 2)": true,
+      "9. Anniversary T-shirt available to mark the 100th anniversary of the V(λ) function (lvl: 2)": true
+    }
   }
 }

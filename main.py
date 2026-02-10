@@ -1,4 +1,5 @@
-from src.html_to_text import process_multiple_docs, download_html, Doc
+from src.extract_text import process_multiple_docs, download_html, Doc
+from src.extract_text_via_bs4 import extract_text_via_bs4
 from src.extract_metadata import extract_metadata
 from src.extract_urls import extract_urls
 from src.chunking import chunking
@@ -6,22 +7,26 @@ from pathlib import Path
 import json
 
 ROOT = Path(__file__).resolve().parents[0]
-SILENT = False
+SILENT = True
 
 def run_pipeline():  # main pipeline runner (loops over getURLs.txt)
     for url in _get_urls_to_process():  # process each line in getURLs.txt
         if not url: continue  # skip empty lines
         html, title = download_html(url, ROOT)  # download base page (no disk writes; Abort safe)
-        metadata = extract_metadata(html)  # extract base metadata (canonical/url/domain/etc)
+        chunk_template = extract_metadata(html)  # extract base metadata (canonical/url/domain/etc)
+        metadata = chunk_template.get('metadata')
         extracted_urls = extract_urls(metadata, html)  # extract candidate URLs as list[(url,count)]
-        docs: list[Doc] = process_multiple_docs(url, html, title, extracted_urls, metadata, ROOT, SILENT)  # open GUI for THIS base URL and return chosen docs
+        docs: list[Doc] = process_multiple_docs(url, html, title, extracted_urls, chunk_template, ROOT, SILENT)  # open GUI for THIS base URL and return chosen docs
         for doc in docs:  # write only after OK (Abort returns empty list)
             Path(f'{ROOT}/data/{doc.title}').mkdir(parents=True, exist_ok=True)  # create per-doc folder
             _write_raw(doc.title, doc.html)
             _write_input(doc.title, doc.html)  # write raw html input
             _write_output(doc.title, doc.text)  # write rendered plaintext output
-            chunks = chunking(doc.title, doc.text, doc.metadata)  # chunk the text for RAG (uses markers)
-            _write_chunks(doc.title, chunks)  # write jsonl chunks            
+            chunks = chunking(doc.text, doc.metadata)  # chunk the text for RAG (uses markers)
+            _write_chunks(doc.title, chunks)  # write jsonl chunks
+        text = extract_text_via_bs4(html)
+        Path(f'{ROOT}/data/BS4 {title}').mkdir(parents=True, exist_ok=True)  # create per-doc folder
+        _write_output(f'BS4 {title}', text)
             
 def _get_urls_to_process() -> list[str]:
         url_path = f'{ROOT}/config/getURLs.txt'
